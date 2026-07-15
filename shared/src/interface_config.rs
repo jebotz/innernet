@@ -1,15 +1,18 @@
-use crate::{chmod, ensure_dirs_exist, Endpoint, Error, IoErrorContext, WrappedIoError};
+use crate::{chmod, ensure_dirs_exist, Endpoint, Error, IoErrorContext, Peer, WrappedIoError};
 use indoc::writedoc;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{self, Write},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
-use wireguard_control::InterfaceName;
+use wireguard_control::{InterfaceName, KeyPair};
 
+/// This struct contains everything necessary to establish an innernet connection: information about
+/// a local innernet interface and a remote innernet server.
 #[derive(Clone, Deserialize, Serialize, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct InterfaceConfig {
@@ -18,6 +21,12 @@ pub struct InterfaceConfig {
 
     /// The necessary contact information for the server.
     pub server: ServerInfo,
+
+    /// A configurable map of peer IP addresses to Endpoints which should
+    /// be used as the WireGuard endpoint for that peer.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    peer_endpoint_overrides: BTreeMap<IpAddr, Endpoint>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -37,6 +46,17 @@ pub struct InterfaceInfo {
     pub listen_port: Option<u16>,
 }
 
+impl InterfaceInfo {
+    pub fn new(network_name: &InterfaceName, keypair: &KeyPair, address: IpNet) -> Self {
+        Self {
+            network_name: network_name.to_string(),
+            private_key: keypair.private.to_base64(),
+            address,
+            listen_port: None,
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct ServerInfo {
@@ -50,65 +70,56 @@ pub struct ServerInfo {
     pub internal_endpoint: SocketAddr,
 }
 
-impl InterfaceConfig {
-    pub fn write_to(
-        &self,
-        target_file: &mut File,
-        comments: bool,
-        mode: Option<u32>,
-    ) -> Result<(), io::Error> {
-        if let Some(val) = mode {
-            chmod(target_file, val)?;
+impl ServerInfo {
+    pub fn new(server_peer: &Peer, internal_endpoint: SocketAddr) -> Self {
+        Self {
+            external_endpoint: server_peer
+                .endpoint
+                .clone()
+                .expect("The innernet server should have a WireGuard endpoint"),
+            internal_endpoint,
+            public_key: server_peer.public_key.clone(),
         }
+    }
+}
 
-        if comments {
-            writedoc!(
-                target_file,
-                r"
-                    # This is an invitation file to an innernet network.
-                    #
-                    # To join, you must install innernet.
-                    # See https://github.com/tonarino/innernet for instructions.
-                    #
-                    # If you have innernet, just run:
-                    #
-                    #   innernet install <this file>
-                    #
-                    # Don't edit the contents below unless you love chaos and dysfunction.
-                "
-            )?;
+impl InterfaceConfig {
+    fn new(interface: InterfaceInfo, server: ServerInfo) -> Self {
+        InterfaceConfig {
+            interface,
+            server,
+            peer_endpoint_overrides: BTreeMap::new(),
         }
-        target_file.write_all(toml::to_string(self).unwrap().as_bytes())?;
-        Ok(())
     }
 
-    pub fn write_to_path<P: AsRef<Path>>(
-        &self,
-        path: P,
-        comments: bool,
-        mode: Option<u32>,
-    ) -> Result<(), WrappedIoError> {
+    /// Save a new config file, failing if it already exists.
+    pub fn save_new(&self, path: impl AsRef<Path>, mode: u32) -> Result<(), WrappedIoError> {
         let path = path.as_ref();
-        let mut target_file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(path)
             .with_path(path)?;
-        self.write_to(&mut target_file, comments, mode)
-            .with_path(path)
+
+        chmod(&file, mode).with_path(path)?;
+
+        file.write_all(self.as_toml().as_bytes()).with_path(path)?;
+
+        Ok(())
     }
 
     /// Overwrites the config file if it already exists.
-    pub fn write_to_interface(
-        &self,
-        config_dir: &Path,
-        interface: &InterfaceName,
-    ) -> Result<PathBuf, Error> {
+    pub fn save(&self, config_dir: &Path, interface: &InterfaceName) -> Result<PathBuf, Error> {
         let path = Self::build_config_file_path(config_dir, interface)?;
         File::create(&path)
             .with_path(&path)?
-            .write_all(toml::to_string(self).unwrap().as_bytes())?;
+            .write_all(self.as_toml().as_bytes())?;
+
         Ok(path)
+    }
+
+    fn as_toml(&self) -> String {
+        toml::to_string(self).unwrap()
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
@@ -129,12 +140,24 @@ impl InterfaceConfig {
             .with_extension("conf")
     }
 
-    fn build_config_file_path(
+    pub fn build_config_file_path(
         config_dir: &Path,
         interface: &InterfaceName,
     ) -> Result<PathBuf, WrappedIoError> {
         ensure_dirs_exist(&[config_dir])?;
         Ok(Self::get_path(config_dir, interface))
+    }
+
+    pub fn peer_endpoint_overrides(&self) -> &BTreeMap<IpAddr, Endpoint> {
+        &self.peer_endpoint_overrides
+    }
+
+    pub fn set_endpoint_override_for_peer(&mut self, peer_ip: IpAddr, endpoint: Endpoint) {
+        self.peer_endpoint_overrides.insert(peer_ip, endpoint);
+    }
+
+    pub fn unset_endpoint_override_for_peer(&mut self, peer_ip: IpAddr) {
+        self.peer_endpoint_overrides.remove(&peer_ip);
     }
 }
 
@@ -143,5 +166,47 @@ impl InterfaceInfo {
         Ok(wireguard_control::Key::from_base64(&self.private_key)?
             .get_public()
             .to_base64())
+    }
+}
+
+#[must_use]
+pub struct PeerInvitation {
+    interface_config: InterfaceConfig,
+}
+
+impl PeerInvitation {
+    pub fn new(interface: InterfaceInfo, server: ServerInfo) -> Self {
+        Self {
+            interface_config: InterfaceConfig::new(interface, server),
+        }
+    }
+
+    /// Save a new invitation file, failing if it already exists.
+    pub fn save_new(&self, path: impl AsRef<Path>) -> Result<(), io::Error> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+
+        writedoc!(
+            file,
+            r"
+                    # This is an invitation file to an innernet network.
+                    #
+                    # To join, you must install innernet.
+                    # See https://github.com/tonarino/innernet for instructions.
+                    #
+                    # If you have innernet, just run:
+                    #
+                    #   innernet install <this file>
+                    #
+                    # Don't edit the contents below unless you love chaos and dysfunction.
+                "
+        )?;
+
+        file.write_all(self.interface_config.as_toml().as_bytes())?;
+
+        Ok(())
     }
 }

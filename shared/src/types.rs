@@ -1,9 +1,10 @@
+use crate::{wg::PeerInfoExt, DEFAULT_HOSTS_PATH};
 use anyhow::{anyhow, Error};
 use clap::{
     builder::{PossibleValuesParser, TypedValueParser},
     Args,
 };
-use ipnet::IpNet;
+use ipnet::{IpNet, PrefixLenError};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -22,8 +23,6 @@ use wireguard_control::{
     AllowedIp, Backend, InterfaceName, InvalidInterfaceName, Key, PeerConfig, PeerConfigBuilder,
     PeerInfo,
 };
-
-use crate::wg::PeerInfoExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interface {
@@ -292,6 +291,10 @@ impl<'a> CidrTree<'a> {
             self.children().flat_map(|child| child.leaves()).collect()
         }
     }
+
+    pub fn ip_net_for(&self, ip: IpAddr) -> Result<IpNet, PrefixLenError> {
+        IpNet::new(ip, self.contents.prefix_len())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -466,6 +469,25 @@ pub struct OverrideEndpointOpts {
     pub yes: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct OverridePeerEndpointOpts {
+    /// Name of peer whose endpoint you want to override
+    #[clap(long)]
+    pub name: Option<Hostname>,
+
+    /// The external endpoint that you'd like to use for a given peer
+    #[clap(short, long)]
+    pub endpoint: Option<Endpoint>,
+
+    /// Unset an existing local endpoint override for this peer
+    #[clap(short, long, conflicts_with = "endpoint")]
+    pub unset: bool,
+
+    /// Bypass confirmation
+    #[clap(long)]
+    pub yes: bool,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct NatOpts {
     #[clap(long)]
@@ -523,16 +545,16 @@ pub struct NetworkOpts {
 #[derive(Clone, Debug, Args)]
 pub struct HostsOpts {
     /// The path to write hosts to
-    #[clap(long = "hosts-path", default_value = "/etc/hosts")]
+    #[clap(long = "hosts-path", default_value = DEFAULT_HOSTS_PATH)]
     pub hosts_path: PathBuf,
 
     /// Don't write to any hosts files
     #[clap(long = "no-write-hosts", conflicts_with = "hosts_path")]
     pub no_write_hosts: bool,
 
-    /// Use a different suffix for hosts, than '<interface>.wg' , ex.
-    /// --host-suffix 'evilnet' names peers: <peer>.evilnet, and
-    /// --host-suffix '' gives peers no suffix, just: <peer>
+    /// Use a different suffix for hosts, than 'INTERFACE.wg' , ex.
+    /// --host-suffix 'evilnet' names peers: PEER.evilnet, and
+    /// --host-suffix '' gives peers no suffix, just: PEER
     #[clap(long = "host-suffix")]
     pub host_suffix: Option<String>,
 }

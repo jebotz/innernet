@@ -1,4 +1,3 @@
-pub use anyhow::Error;
 use colored::Colorize;
 use hostsfile::HostsBuilder;
 use ipnet::IpNet;
@@ -15,15 +14,18 @@ use wireguard_control::InterfaceName;
 pub mod interface_config;
 #[cfg(target_os = "linux")]
 mod netlink;
+pub mod peer;
 pub mod prompts;
 pub mod types;
 pub mod wg;
 
+pub use anyhow::Error;
 pub use types::*;
 
 pub const REDEEM_TRANSITION_WAIT: Duration = Duration::from_secs(5);
 pub const PERSISTENT_KEEPALIVE_INTERVAL_SECS: u16 = 25;
 pub const INNERNET_PUBKEY_HEADER: &str = "X-Innernet-Server-Key";
+pub const DEFAULT_HOSTS_PATH: &str = "/etc/hosts";
 
 pub fn ensure_dirs_exist(dirs: &[&Path]) -> Result<(), WrappedIoError> {
     for dir in dirs {
@@ -33,7 +35,7 @@ pub fn ensure_dirs_exist(dirs: &[&Path]) -> Result<(), WrappedIoError> {
                 std::fs::set_permissions(dir, Permissions::from_mode(0o700)).with_path(dir)?;
             },
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                warn_on_dangerous_mode(dir).with_path(dir)?;
+                // Directory already exists, good.
             },
             Err(e) => {
                 return Err(e);

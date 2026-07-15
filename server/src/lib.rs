@@ -1,12 +1,15 @@
 use anyhow::{anyhow, bail};
 use colored::*;
+use db::{DatabaseCidr, DatabasePeer};
 use dialoguer::Confirm;
 use hyper::{http, server::conn::AddrStream, Body, Request, Response};
 use indoc::printdoc;
 use innernet_shared::{
-    get_local_addrs, update_hosts_file, AddCidrOpts, AddPeerOpts, DeleteCidrOpts,
-    EnableDisablePeerOpts, Endpoint, HostsOpts, IoErrorContext, NetworkOpts, PeerContents,
-    RenameCidrOpts, RenamePeerOpts, INNERNET_PUBKEY_HEADER,
+    get_local_addrs,
+    interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
+    prompts, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
+    EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface, IoErrorContext, NetworkOpts,
+    PeerContents, RenameCidrOpts, RenamePeerOpts, INNERNET_PUBKEY_HEADER,
 };
 use ipnet::IpNet;
 use parking_lot::{Mutex, RwLock};
@@ -25,7 +28,9 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
-use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
+use wireguard_control::{
+    Backend, Device, DeviceUpdate, InterfaceName, Key, KeyPair, PeerConfigBuilder,
+};
 
 mod api;
 mod db;
@@ -35,9 +40,7 @@ pub mod initialize;
 mod test;
 mod util;
 
-use db::{DatabaseCidr, DatabasePeer};
 pub use error::ServerError;
-use innernet_shared::{prompts, wg, CidrTree, Error, Interface};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -163,6 +166,7 @@ fn open_database_connection(
         );
     }
 
+    // TODO(strohel): warn about too open permissions on the db file?
     let conn = Connection::open(&database_path)?;
     // Foreign key constraints aren't on in SQLite by default. Enable.
     conn.pragma_update(None, "foreign_keys", 1)?;
@@ -185,9 +189,12 @@ pub fn add_peer(
     let cidrs = DatabaseCidr::list(&conn)?;
     let cidr_tree = CidrTree::new(&cidrs[..]);
 
-    if let Some(result) = innernet_shared::prompts::add_peer(&peers, &cidr_tree, &opts)? {
-        let (peer_request, keypair, target_path, mut target_file) = result;
-        let peer = DatabasePeer::create(&conn, peer_request)?;
+    if let Some((new_peer_info, target_path)) =
+        innernet_shared::prompts::gather_new_peer_info(&peers, &cidr_tree, &opts)?
+    {
+        let keypair = KeyPair::generate();
+        let peer_contents = new_peer_info.into_peer_contents(&keypair);
+        let peer = DatabasePeer::create(&conn, peer_contents)?;
         if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
             // Update the current WireGuard interface with the new peers.
             DeviceUpdate::new()
@@ -198,16 +205,17 @@ pub fn add_peer(
             println!("adding to WireGuard interface: {}", &*peer);
         }
 
+        let address = cidr_tree
+            .ip_net_for(peer.ip)
+            .expect("Peer's IpNet address to be valid because the peer was created successfully.");
+        let interface_info = InterfaceInfo::new(interface, &keypair, address);
+
+        let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
         let server_peer = DatabasePeer::get(&conn, 1)?;
-        prompts::write_peer_invitation(
-            (&mut target_file, &target_path),
-            interface,
-            &peer,
-            &server_peer,
-            &cidr_tree,
-            keypair,
-            &SocketAddr::new(config.address, config.listen_port),
-        )?;
+        let server_info = ServerInfo::new(&server_peer, internal_endpoint);
+
+        let invitation = PeerInvitation::new(interface_info, server_info);
+        invitation.save_new(target_path)?;
     } else {
         println!("exited without creating peer.");
     }
@@ -479,7 +487,7 @@ pub async fn serve(
         IpNet::new(config.address, config.network_cidr_prefix)?,
         Some(config.listen_port),
         None,
-        network,
+        &network,
     )?;
 
     DeviceUpdate::new()
