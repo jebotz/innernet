@@ -26,6 +26,7 @@ path = "src/main.rs"
 
 [features]
 v6-test = []
+selinux = ["innernet-shared/selinux"]
 
 [dependencies]
 anyhow = "1"
