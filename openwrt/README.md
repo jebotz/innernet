@@ -72,11 +72,12 @@ via `PKG_BUILD_DEPENDS`; the first build will take a while.
 
 ```
 make package/innernet/compile V=s
+make package/luci-proto-innernet/compile V=s
 ```
 
-The resulting `.apk` lands under `bin/packages/mipsel_24kc/innernet/`.
-Install it on the router with `apk install` (or bake it into a full image
-via `make` at the top level once it's selected in menuconfig).
+The resulting `.apk`s land under `bin/packages/mipsel_24kc/innernet/`.
+Install them on the router with `apk add` (or bake them into a full image
+via `make` at the top level once they're selected in menuconfig).
 
 ## Iterating on source changes
 
@@ -152,6 +153,136 @@ Without `luci-proto-innernet` installed, LuCI will still show "Unsupported
 protocol" for this section even though it works fine everywhere else
 (`ifstatus home`, firewall zone assignment, `/etc/init.d/network reload`,
 etc. all work without it).
+
+## Rebuilding from a fresh checkout (e.g. after an OpenWrt upgrade)
+
+Full runbook assuming a completely fresh system — no buildroot, no
+toolchain, nothing cached. This is also what "rebuild after upgrading the
+router" means in practice: `kmod-wireguard` (an `innernet` dependency) is
+tied to the exact kernel ABI of the target firmware, so an `.apk` built
+against one OpenWrt release isn't guaranteed to work after the router
+moves to another — don't just reuse an old build.
+
+### 0. Before you upgrade the router
+
+Back up `/etc/innernet` — it holds the node's WireGuard private key and
+per-network config written by `innernet install`, and isn't covered by
+OpenWrt's normal `/etc/config` sysupgrade backup:
+
+```
+scp -r root@router:/etc/innernet ./innernet-backup-$(date +%Y%m%d)
+```
+
+Or, better, make this permanent so every future sysupgrade includes it
+automatically:
+
+```
+ssh root@router "echo '/etc/innernet' >> /etc/sysupgrade.conf"
+```
+
+`/etc/config/innernet` (UCI settings) and `/etc/config/network` (the
+`innernet` proto stanza, if you added one) are already covered by the
+default sysupgrade backup — nothing to do there.
+
+### 1. Match the buildroot to the router's new firmware version
+
+After the router's upgraded, check exactly what it's running:
+
+```
+ssh root@router cat /etc/openwrt_release
+```
+
+Clone the buildroot and check out the matching release, not `main`:
+
+```
+git clone https://git.openwrt.org/openwrt/openwrt.git
+cd openwrt
+git checkout v24.10.3   # match DISTRIB_RELEASE from /etc/openwrt_release
+```
+
+### 2. Install build prerequisites
+
+Follow OpenWrt's own list for your distro:
+https://openwrt.org/docs/guide-developer/toolchain/install-buildsystem
+
+On Fedora-family hosts, also grab `perl-JSON-PP` — `scripts/feeds install`
+fails with `Can't locate JSON/PP.pm` without it:
+
+```
+sudo dnf install -y perl-JSON-PP
+```
+
+Leave yourself generous free disk space: `lang/rust` builds the Rust
+compiler and LLVM from source as a host tool (`PKG_HOST_ONLY:=1`), which is
+the single biggest consumer.
+
+### 3. Clone your innernet fork and set up feeds
+
+```
+git clone https://github.com/jebotz/innernet.git
+cd openwrt   # back in the buildroot
+./scripts/feeds update -a
+./scripts/feeds install -a -p packages   # brings in lang/rust
+./scripts/feeds install -a -p luci       # brings in luci-base
+```
+
+Add `src-link innernet /path/to/innernet/openwrt` to `feeds.conf.default`,
+then:
+
+```
+./scripts/feeds update innernet
+./scripts/feeds install -a -p innernet
+```
+
+### 4. Configure
+
+`make menuconfig` — set the target/profile and select both `innernet` and
+`luci-proto-innernet`, as described above in "Configure".
+
+That selection isn't optional for a standalone package build: `make
+package/<name>/compile` silently no-ops for anything not selected in
+`.config` (`CONFIG_PACKAGE_<name>` unset) — no warning, it just skips the
+real build. (`make DEVELOPER=1 package/.../compile` bypasses this, but
+force-builds every *other* unselected package it happens to touch along
+the way too, which can fail on things that have nothing to do with your
+package — hit a broken `libquadmath` toolchain sub-build this way once.
+Menuconfig selection is the reliable path.)
+
+### 5. Build the one-time prerequisite chain
+
+On a fresh checkout, these need to run once, in order, before any package
+will compile:
+
+```
+make tools/install
+make toolchain/install
+make target/linux/compile
+```
+
+### 6. Build the packages
+
+```
+make package/innernet/compile V=s
+make package/luci-proto-innernet/compile V=s
+```
+
+Output lands in `bin/packages/<arch>/innernet/` (see "Build" above) —
+`<arch>` was `mipsel_24kc` for mt7621; confirm it's unchanged for the new
+release with `ls bin/packages/`.
+
+### 7. Install on the router
+
+```
+scp bin/packages/*/innernet/{innernet-*.apk,luci-proto-innernet-*.apk} root@router:/tmp/
+ssh root@router
+apk add --allow-untrusted /tmp/innernet-*.apk /tmp/luci-proto-innernet-*.apk
+```
+
+If `/etc/innernet` didn't come back automatically (see step 0), restore it
+now. `/etc/config/network`'s `innernet` proto stanza and
+`/etc/config/innernet` should already be in place from the sysupgrade
+backup, so `/etc/init.d/network reload` (or a reboot) should be all that's
+needed to pick everything back up.
 
 ## Known open items before this is upstream-ready
 
