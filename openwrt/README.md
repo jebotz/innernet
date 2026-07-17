@@ -4,9 +4,18 @@ Self-hosted OpenWrt package feed for the innernet client, currently scoped
 to a single target: `ramips/mt7621` (this covers the MikroTik RB750Gr3).
 Only the client (`innernet`) is packaged — no server.
 
+Two packages:
+- `net/innernet` — the client binary, procd init script, UCI config, and a
+  `netifd` protocol handler so a network brought up by the daemon can be
+  recognized as a logical interface.
+- `luci-proto-innernet` — LuCI-side frontend for that protocol handler
+  (without it, LuCI shows "Unsupported protocol" for `innernet` interfaces
+  even though `netifd`/the CLI handle them fine).
+
 Layout mirrors the real `openwrt/packages` feed (`<category>/<pkgname>/`)
 on purpose, so moving `net/innernet` into a PR against that feed later is
-close to a copy-paste.
+close to a copy-paste. `luci-proto-innernet` would move into the `luci`
+feed's `protocols/` directory instead.
 
 ## One-time OpenWrt build setup
 
@@ -18,6 +27,7 @@ git clone https://git.openwrt.org/openwrt/openwrt.git
 cd openwrt
 ./scripts/feeds update -a
 ./scripts/feeds install -a -p packages   # brings in lang/rust
+./scripts/feeds install -a -p luci       # brings in luci-base, for luci-proto-innernet
 ```
 
 Add this feed by pointing at your local checkout of *this* repo's
@@ -49,6 +59,11 @@ make menuconfig
 - Network → VPN → `innernet` (built-in, i.e. `<*>`, not `<M>`, keeps this
   simple for a single-purpose image; switch to module if you'd rather
   install the .apk after the fact instead of baking it into the firmware).
+- LuCI → 6. Protocols → `luci-proto-innernet`, if you want the `innernet`
+  network recognized under LuCI's Network → Interfaces page instead of
+  showing up as "Unsupported protocol". Only needed on boxes running LuCI;
+  the CLI (`innernet show`, `ip link`, etc.) and firewall/netifd don't need
+  it.
 
 Building it pulls in the Rust host toolchain (`rust/host`) automatically
 via `PKG_BUILD_DEPENDS`; the first build will take a while.
@@ -112,6 +127,31 @@ Notes on the defaults:
   fairly often, and `/etc/hosts` lives on flash. Wire it into dnsmasq with
   `uci add_list dhcp.@dnsmasq[0].addnhosts='/tmp/hosts/innernet'` if you
   want peer names resolvable.
+
+## Making the interface visible to netifd/LuCI
+
+`/etc/init.d/innernet` brings the WireGuard device up on its own — this
+step is optional, and only matters if you want the interface to show up
+under LuCI's Network → Interfaces, be assignable to a firewall zone, or be
+fed to dnsmasq via a logical interface rather than a raw device name.
+
+Add a matching `interface` section to `/etc/config/network`, named exactly
+the same as the `network` section in `/etc/config/innernet` (and the actual
+device name shown by `innernet show`):
+
+```
+config interface 'home'
+	option proto 'innernet'
+```
+
+That's it — no address/gateway/etc. to configure, since the innernet daemon
+already owns bringing the device up and assigning it an address; the
+`netifd` proto handler (`/lib/netifd/proto/innernet.sh`, from the
+`innernet` package) just reports the existing device's state to netifd.
+Without `luci-proto-innernet` installed, LuCI will still show "Unsupported
+protocol" for this section even though it works fine everywhere else
+(`ifstatus home`, firewall zone assignment, `/etc/init.d/network reload`,
+etc. all work without it).
 
 ## Known open items before this is upstream-ready
 

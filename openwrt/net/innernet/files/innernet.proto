@@ -1,0 +1,58 @@
+#!/bin/sh
+# netifd protocol handler for innernet.
+#
+# The device itself is created and kept up by the innernet daemon
+# (`innernet up --daemon`), started independently via /etc/init.d/innernet
+# and configured through /etc/config/innernet -- not by this script. This
+# handler only makes the resulting WireGuard device visible to netifd, so
+# it can be assigned to a firewall zone, listed under Network > Interfaces,
+# and picked up by dnsmasq like any other logical interface.
+#
+# The interface section name here (e.g. `config interface 'inbotz'`) is
+# expected to match the actual device name -- the same name used for the
+# matching `network` section in /etc/config/innernet and shown by
+# `innernet show`.
+
+[ -n "$INCLUDE_ONLY" ] || {
+	. /lib/functions.sh
+	. ../netifd-proto.sh
+	init_proto "$@"
+}
+
+proto_innernet_init_config() {
+	no_device=1
+	available=1
+}
+
+proto_innernet_setup() {
+	local cfg="$1"
+
+	if [ ! -d "/sys/class/net/$cfg" ]; then
+		logger -t innernet "device $cfg not present -- is /etc/init.d/innernet running with a matching 'network' section in /etc/config/innernet?"
+		return 1
+	fi
+
+	proto_init_update "$cfg" 1
+
+	local address
+	for address in $(ip -4 -o addr show dev "$cfg" | awk '{print $4}'); do
+		proto_add_ipv4_address "${address%%/*}" "${address##*/}"
+	done
+	for address in $(ip -6 -o addr show dev "$cfg" scope global | awk '{print $4}'); do
+		proto_add_ipv6_address "${address%%/*}" "${address##*/}"
+	done
+
+	proto_send_update "$cfg"
+}
+
+proto_innernet_teardown() {
+	local cfg="$1"
+	# The innernet daemon owns this device's lifecycle independently of
+	# netifd (see /etc/init.d/innernet); nothing to tear down here.
+	proto_init_update "$cfg" 0
+	proto_send_update "$cfg"
+}
+
+[ -n "$INCLUDE_ONLY" ] || {
+	add_protocol innernet
+}

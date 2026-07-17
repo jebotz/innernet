@@ -64,6 +64,9 @@ define Package/innernet/install
 	$(INSTALL_CONF) ./files/innernet.config $(1)/etc/config/innernet
 
 	$(INSTALL_DIR) $(1)/etc/innernet
+
+	$(INSTALL_DIR) $(1)/lib/netifd/proto
+	$(INSTALL_BIN) ./files/innernet.proto $(1)/lib/netifd/proto/innernet.sh
 endef
 
 $(eval $(call RustBinPackage,innernet))
